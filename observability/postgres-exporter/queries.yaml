@@ -1,0 +1,55 @@
+# Custom queries for postgres_exporter (--extend.query-path). They define the
+# exact metric names used by the PostgreSQL dashboard and alert rules.
+
+# Connection saturation: active vs total vs max_connections.
+pg_connections:
+  query: |
+    SELECT
+      count(*) FILTER (WHERE state = 'active')                 AS active,
+      count(*) FILTER (WHERE state = 'idle')                   AS idle,
+      count(*) FILTER (WHERE state = 'idle in transaction')    AS idle_in_transaction,
+      count(*)                                                 AS total,
+      (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+  master: true
+  metrics:
+    - active:              { usage: GAUGE, description: "Connections executing a query" }
+    - idle:                { usage: GAUGE, description: "Idle connections" }
+    - idle_in_transaction: { usage: GAUGE, description: "Connections idle in a transaction" }
+    - total:               { usage: GAUGE, description: "All client connections" }
+    - max:                 { usage: GAUGE, description: "max_connections setting" }
+
+# Replication lag as seen from the PRIMARY (one row per connected standby).
+pg_replication_stat:
+  query: |
+    SELECT
+      application_name,
+      state,
+      COALESCE(EXTRACT(EPOCH FROM write_lag), 0)  AS write_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM flush_lag), 0)  AS flush_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM replay_lag), 0) AS replay_lag_seconds,
+      COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0) AS lag_bytes
+    FROM pg_stat_replication
+  master: true
+  metrics:
+    - application_name:   { usage: LABEL, description: "Standby application_name" }
+    - state:              { usage: LABEL, description: "Replication state" }
+    - write_lag_seconds:  { usage: GAUGE, description: "Time until WAL is written on the standby" }
+    - flush_lag_seconds:  { usage: GAUGE, description: "Time until WAL is flushed on the standby" }
+    - replay_lag_seconds: { usage: GAUGE, description: "Time until WAL is replayed on the standby" }
+    - lag_bytes:          { usage: GAUGE, description: "WAL bytes not yet replayed on the standby" }
+
+# Replica-side view (0 on the primary). NB: on an idle primary this grows
+# because no transactions arrive -- prefer pg_replication_stat_* for alerting.
+pg_replica_status:
+  query: |
+    SELECT
+      CASE WHEN pg_is_in_recovery() THEN 1 ELSE 0 END AS is_replica,
+      CASE WHEN pg_is_in_recovery()
+           THEN COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())), 0)
+           ELSE 0 END AS apply_delay_seconds
+  master: true
+  metrics:
+    - is_replica:          { usage: GAUGE, description: "1 when this node is a standby" }
+    - apply_delay_seconds: { usage: GAUGE, description: "Seconds since the last replayed transaction" }

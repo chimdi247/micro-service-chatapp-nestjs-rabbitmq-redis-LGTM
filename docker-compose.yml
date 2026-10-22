@@ -1,0 +1,796 @@
+# =============================================================================
+# ChatApp -- application + data layer + full observability stack.
+#   docker compose up --build
+#
+# Sections: 1) shared YAML anchors  2) data layer (+ pooling, replica)
+#           3) application services  4) observability  5) exporters  6) test tooling
+# Grafana: http://localhost:3001  (see .env for credentials)
+# =============================================================================
+
+# ----------------------------------------------------------------------------- 1) anchors
+x-otel-env: &otel-env
+  # Every Node service pushes traces + metrics + logs (OTLP/HTTP) to the collector.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_always_on}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
+  DEPLOYMENT_ENVIRONMENT: ${DEPLOYMENT_ENVIRONMENT:-local}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-s3-env: &s3-env
+  # S3-compatible object storage used by Mimir / Loki / Tempo. Defaults target
+  # the bundled MinIO; override in .env to use AWS S3 (see observability/README.md).
+  S3_ENDPOINT: ${S3_ENDPOINT:-minio:9000}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-${MINIO_ROOT_USER:-minioadmin}}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-minioadmin123}}
+  S3_INSECURE: ${S3_INSECURE:-true}
+  MIMIR_BLOCKS_BUCKET: ${MIMIR_BLOCKS_BUCKET:-mimir-blocks}
+  MIMIR_RULER_BUCKET: ${MIMIR_RULER_BUCKET:-mimir-ruler}
+  MIMIR_ALERTMANAGER_BUCKET: ${MIMIR_ALERTMANAGER_BUCKET:-mimir-alertmanager}
+  LOKI_BUCKET: ${LOKI_BUCKET:-loki-chunks}
+  TEMPO_BUCKET: ${TEMPO_BUCKET:-tempo-traces}
+
+x-app-limits: &app-limits
+  # Limits make "% of limit" CPU/memory dashboards and the >40% alerts meaningful.
+  resources:
+    limits:
+      cpus: "0.50"
+      memory: 512M
+
+services:
+
+  # =========================================================================== 2) data layer
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: chatapp-rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      # Enables the built-in Prometheus endpoint on :15692 (scraped by Prometheus).
+      - ./observability/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7
+    container_name: chatapp-redis
+    # maxmemory makes "Memory Usage (%)" computable; the data is a TTL cache so
+    # LRU eviction is safe.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - chatapp-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Web UI for browsing/inspecting Redis keys (conversation cache).
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: chatapp-redis-commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+      HTTP_USER: ${REDIS_COMMANDER_USER:-admin}
+      HTTP_PASSWORD: ${REDIS_COMMANDER_PASSWORD:-admin123}
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    container_name: chatapp-mongo
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-chatapp_mongo_user}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-chatapp_mongo_password}
+    volumes:
+      - mongo-data:/data/db
+      - ./docker/init-db/mongo:/docker-entrypoint-initdb.d:ro
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---- PostgreSQL primary (user-service) --------------------------------------
+  user-db:
+    image: postgres:16
+    container_name: chatapp-user-db
+    # WAL settings enable streaming replication to user-db-replica.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=512MB
+      - -c
+      - hot_standby=on
+      - -c
+      - max_connections=200
+    environment:
+      POSTGRES_DB: ${USER_DB_NAME:-chatapp_user_service}
+      POSTGRES_USER: ${USER_DB_USER:-chatapp_user}
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD:-chatapp_user_password}
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator_password}
+    ports:
+      - '${USER_DB_PORT:-5432}:5432'
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+      # Schema + seed + 03-replication.sh (replication role + pg_hba entry). First boot only.
+      - ./docker/init-db/user-postgres:/docker-entrypoint-initdb.d:ro
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${USER_DB_USER:-chatapp_user} -d ${USER_DB_NAME:-chatapp_user_service}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- PostgreSQL streaming replica (gives the replication-lag panel real data) ----
+  user-db-replica:
+    image: postgres:16
+    container_name: chatapp-user-db-replica
+    entrypoint: ["/bin/bash", "/docker/replica-entrypoint.sh"]
+    environment:
+      PRIMARY_HOST: user-db
+      POSTGRES_USER: ${USER_DB_USER:-chatapp_user}
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD:-chatapp_user_password}
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator_password}
+    volumes:
+      - user-db-replica-data:/var/lib/postgresql/data
+      - ./docker/postgres/replica-entrypoint.sh:/docker/replica-entrypoint.sh:ro
+    depends_on:
+      user-db:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  # ---- PgBouncer: connection pooling for PostgreSQL ---------------------------
+  pgbouncer:
+    image: ${PGBOUNCER_IMAGE:-edoburu/pgbouncer:latest}
+    container_name: chatapp-pgbouncer
+    # Run pgbouncer directly with OUR config (skips the image's env-based generator).
+    entrypoint: ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+    volumes:
+      - ./docker/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      user-db:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---- MySQL (auth-service) ---------------------------------------------------
+  auth-db:
+    image: mysql:8.0
+    container_name: chatapp-auth-db
+    environment:
+      MYSQL_DATABASE: ${AUTH_DB_NAME:-chatapp_auth_service}
+      MYSQL_USER: ${AUTH_DB_USER:-chatapp_auth_user}
+      MYSQL_PASSWORD: ${AUTH_DB_PASSWORD:-chatapp_auth_password}
+      MYSQL_ROOT_PASSWORD: ${AUTH_DB_ROOT_PASSWORD:-chatapp_auth_root_password}
+    command: ["mysqld", "--default-authentication-plugin=mysql_native_password"]
+    ports:
+      - "${AUTH_DB_PORT:-3306}:3306"
+    volumes:
+      - auth-db-data:/var/lib/mysql
+      # Schema + seed + 03-monitoring.sql (exporter + proxysql monitor users).
+      - ./docker/init-db/auth-mysql:/docker-entrypoint-initdb.d:ro
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${AUTH_DB_ROOT_PASSWORD:-chatapp_auth_root_password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---- ProxySQL: connection pooling for MySQL ---------------------------------
+  proxysql:
+    image: ${PROXYSQL_IMAGE:-proxysql/proxysql:2.7.1}
+    container_name: chatapp-proxysql
+    # --initial: always (re)load /etc/proxysql.cnf, so the file stays the source of truth.
+    command: ["proxysql", "-f", "--initial", "-c", "/etc/proxysql.cnf"]
+    volumes:
+      - ./docker/proxysql/proxysql.cnf:/etc/proxysql.cnf:ro
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6033'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # =========================================================================== 3) application
+  gateway-service:
+    build:
+      context: .
+      dockerfile: services/gateway-service/Dockerfile
+    container_name: chatapp-gateway-service
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: gateway-service
+      NODE_ENV: ${NODE_ENV:-production}
+      GATEWAY_PORT: ${GATEWAY_PORT:-4000}
+      USER_SERVICE_URL: http://user-service:4001
+      AUTH_SERVICE_URL: http://auth-service:4003
+      CHAT_SERVICE_URL: http://chat-service:4002
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN must be set in .env}
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      chat-service:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - chatapp-network
+    deploy: *app-limits
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    container_name: chatapp-auth-service
+    ports:
+      - "${AUTH_SERVICE_PORT:-4003}:4003"
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: auth-service
+      NODE_ENV: ${NODE_ENV:-production}
+      AUTH_SERVICE_PORT: ${AUTH_SERVICE_PORT:-4003}
+      # Goes through ProxySQL (connection pooling), not straight to MySQL.
+      AUTH_DB_URL: ${AUTH_DB_URL:-mysql://chatapp_auth_user:chatapp_auth_password@proxysql:6033/chatapp_auth_service}
+      DB_POOL_MAX: ${AUTH_DB_POOL_MAX:-10}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1d}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET must be set in .env}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-30d}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN must be set in .env}
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      proxysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - chatapp-network
+    deploy: *app-limits
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  user-service:
+    build:
+      context: .
+      dockerfile: services/user-service/Dockerfile
+    container_name: chatapp-user-service
+    ports:
+      - "${USER_SERVICE_PORT:-4001}:4001"
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: user-service
+      NODE_ENV: ${NODE_ENV:-production}
+      USER_SERVICE_PORT: ${USER_SERVICE_PORT:-4001}
+      # Goes through PgBouncer (transaction pooling), not straight to PostgreSQL.
+      USER_DB_URL: ${USER_DB_URL:-postgres://chatapp_user:chatapp_user_password@pgbouncer:5432/chatapp_user_service}
+      DB_POOL_MAX: ${USER_DB_POOL_MAX:-10}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN must be set in .env}
+    depends_on:
+      user-db:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - chatapp-network
+    deploy: *app-limits
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  chat-service:
+    build:
+      context: .
+      dockerfile: services/chat-service/Dockerfile
+    container_name: chatapp-chat-service
+    ports:
+      - "${CHAT_SERVICE_PORT:-4002}:4002"
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: chat-service
+      NODE_ENV: ${NODE_ENV:-production}
+      CHAT_SERVICE_PORT: ${CHAT_SERVICE_PORT:-4002}
+      MONGO_URL: ${MONGO_URL:-mongodb://chatapp_mongo_user:chatapp_mongo_password@mongo:27017/chatapp_chat_service?authSource=admin}
+      # MongoDB driver connection pool (monitored via CMAP events).
+      MONGO_MAX_POOL_SIZE: ${MONGO_MAX_POOL_SIZE:-20}
+      MONGO_MIN_POOL_SIZE: ${MONGO_MIN_POOL_SIZE:-2}
+      MONGO_WAIT_QUEUE_TIMEOUT_MS: ${MONGO_WAIT_QUEUE_TIMEOUT_MS:-5000}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN must be set in .env}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - chatapp-network
+    deploy: *app-limits
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # React + shadcn/ui client
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://136.71.169.139:${GATEWAY_PORT:-4000}
+    container_name: chatapp-client
+    ports:
+      - "${CLIENT_PORT:-3000}:80"
+    depends_on:
+      gateway-service:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    restart: unless-stopped
+
+  # =========================================================================== 4) observability
+  # ---- S3-compatible object storage (persistent bucket storage) ---------------
+  minio:
+    image: elestio/minio:latest
+    container_name: chatapp-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - chatapp-network
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: creates the buckets Mimir, Loki and Tempo store their data in.
+  minio-init:
+    image: amazon/aws-cli:latest
+    container_name: chatapp-minio-init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        EP="--endpoint-url http://minio:9000"
+        for b in ${MIMIR_BLOCKS_BUCKET:-mimir-blocks} ${MIMIR_RULER_BUCKET:-mimir-ruler} ${MIMIR_ALERTMANAGER_BUCKET:-mimir-alertmanager} ${LOKI_BUCKET:-loki-chunks} ${TEMPO_BUCKET:-tempo-traces}; do
+          aws $$EP s3api head-bucket --bucket $$b 2>/dev/null || aws $$EP s3 mb s3://$$b
+        done
+        echo "buckets ready"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: "no"
+
+  # One-shot: Mimir/Loki/Tempo run as uid 10001 and need to own their data volumes.
+  obs-init:
+    image: busybox:1.37
+    container_name: chatapp-obs-init
+    user: root
+    command: ["sh", "-c", "chown -R 10001:10001 /mimir /loki /tempo"]
+    volumes:
+      - mimir-data:/mimir
+      - loki-data:/loki
+      - tempo-data:/tempo
+    restart: "no"
+
+  mimir:
+    image: grafana/mimir:2.15.0
+    container_name: chatapp-mimir
+    command: ["-config.file=/etc/mimir/mimir.yaml", "-config.expand-env=true", "-target=all"]
+    environment:
+      <<: *s3-env
+    ports:
+      - "${MIMIR_PORT:-9009}:9009"
+    volumes:
+      - ./observability/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      obs-init:
+        condition: service_completed_successfully
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: chatapp-loki
+    command: ["-config.file=/etc/loki/loki.yaml", "-config.expand-env=true"]
+    environment:
+      <<: *s3-env
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      obs-init:
+        condition: service_completed_successfully
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.7.1
+    container_name: chatapp-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml", "-config.expand-env=true"]
+    environment:
+      <<: *s3-env
+    ports:
+      - "${TEMPO_PORT:-3200}:3200"
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      obs-init:
+        condition: service_completed_successfully
+      mimir:
+        condition: service_started
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  # Single OTLP entry point: traces -> Tempo, metrics -> Mimir, logs -> Loki.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    container_name: chatapp-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    volumes:
+      - ./observability/otel-collector/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - tempo
+      - loki
+      - mimir
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  # Prometheus in agent mode: scrapes exporters, remote-writes to Mimir.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: chatapp-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --enable-feature=agent
+      - --storage.agent.path=/prometheus
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - mimir
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: chatapp-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://136.71.169.139:${GRAFANA_PORT:-3001}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/chatapp-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Grafana-managed (unified) alerting + SMTP for email notifications.
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_ALERTING_ENABLED: "false"
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: ${SMTP_HOST:-}:${SMTP_PORT:-}
+      GF_SMTP_USER: ${SMTP_USER:-}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-grafana-alerts@chatapp.com}
+      GF_SMTP_FROM_NAME: ${SMTP_FROM_NAME:-ChatApp Alerts}
+      GF_SMTP_SKIP_VERIFY: ${SMTP_SKIP_VERIFY:-true}
+      GF_SMTP_STARTTLS_POLICY: ${SMTP_STARTTLS_POLICY:-}
+      # Interpolated inside provisioning/alerting/contact-points.yaml
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - mimir
+      - loki
+      - tempo
+      - mailpit
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  # Local SMTP sink: alert emails show up at http://localhost:8025. For real
+  # delivery set SMTP_* in .env (e.g. smtp.gmail.com / SES / SendGrid).
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: chatapp-mailpit
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  # =========================================================================== 5) exporters
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: chatapp-cadvisor
+    privileged: true
+    command:
+      - --housekeeping_interval=15s
+      - --docker_only=true
+      - --store_container_labels=false
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,referenced_memory,hugetlb,resctrl,cpu_topology
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: chatapp-node-exporter
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|run)($$|/)
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  postgres-exporter-primary:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: chatapp-postgres-exporter-primary
+    command: ["--extend.query-path=/etc/postgres_exporter/queries.yaml"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://${USER_DB_USER:-chatapp_user}:${USER_DB_PASSWORD:-chatapp_user_password}@user-db:5432/${USER_DB_NAME:-chatapp_user_service}?sslmode=disable
+    volumes:
+      - ./observability/postgres-exporter/queries.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      user-db:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  postgres-exporter-replica:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: chatapp-postgres-exporter-replica
+    command: ["--extend.query-path=/etc/postgres_exporter/queries.yaml"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://${USER_DB_USER:-chatapp_user}:${USER_DB_PASSWORD:-chatapp_user_password}@user-db-replica:5432/${USER_DB_NAME:-chatapp_user_service}?sslmode=disable
+    volumes:
+      - ./observability/postgres-exporter/queries.yaml:/etc/postgres_exporter/queries.yaml:ro
+    depends_on:
+      - user-db-replica
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  pgbouncer-exporter:
+    image: quay.io/prometheuscommunity/pgbouncer-exporter:v0.10.2
+    container_name: chatapp-pgbouncer-exporter
+    command:
+      - --pgBouncer.connectionString=postgres://${USER_DB_USER:-chatapp_user}:${USER_DB_PASSWORD:-chatapp_user_password}@pgbouncer:5432/pgbouncer?sslmode=disable
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.16.0
+    container_name: chatapp-mysqld-exporter
+    command:
+      - --mysqld.address=auth-db:3306
+      - --mysqld.username=exporter
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQL_EXPORTER_PASSWORD:-exporter_password}
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: chatapp-redis-exporter
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: chatapp-blackbox-exporter
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./observability/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    networks:
+      - chatapp-network
+    restart: unless-stopped
+
+  # =========================================================================== 6) test tooling
+  # Opt-in:  docker compose --profile tests run --rm k6 run -o experimental-prometheus-rw /scripts/load.js
+  k6:
+    profiles: ["tests"]
+    image: grafana/k6:latest
+    container_name: chatapp-k6
+    environment:
+      BASE_URL: http://gateway-service:4000
+      K6_PROMETHEUS_RW_SERVER_URL: http://mimir:9009/api/v1/push
+      K6_PROMETHEUS_RW_TREND_STATS: "p(95),p(99),avg,max"
+      K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM: "false"
+    volumes:
+      - ./tests/k6:/scripts:ro
+    networks:
+      - chatapp-network
+
+  # Remote WebDriver for the Selenium suite:  SELENIUM_REMOTE_URL=http://localhost:4444/wd/hub
+  selenium:
+    profiles: ["tests"]
+    image: selenium/standalone-chrome:latest
+    container_name: chatapp-selenium
+    shm_size: 2gb
+    # Host networking (Linux): the browser must reach the client on localhost:3000
+    # and the gateway on localhost:4000 (the API URL is baked into the client build).
+    network_mode: host
+
+volumes:
+  user-db-data:
+  user-db-replica-data:
+  mongo-data:
+  auth-db-data:
+  redis-data:
+  rabbitmq-data:
+  minio-data:
+  mimir-data:
+  loki-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  chatapp-network:
+    driver: bridge

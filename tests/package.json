@@ -1,0 +1,33 @@
+{
+  "name": "chatapp-tests",
+  "private": true,
+  "type": "module",
+  "description": "Unit, integration, E2E (Playwright), Selenium and k6 performance tests for ChatApp",
+  "scripts": {
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:observability": "vitest run --config vitest.integration.config.ts integration/observability.test.ts",
+    "test:e2e": "playwright test --config e2e/playwright.config.ts",
+    "test:e2e:install": "playwright install --with-deps chromium",
+    "test:selenium": "vitest run --config vitest.selenium.config.ts",
+    "k6:smoke": "k6 run k6/smoke.js",
+    "k6:load": "k6 run k6/load.js",
+    "k6:stress": "k6 run k6/stress.js",
+    "k6:spike": "k6 run k6/spike.js",
+    "k6:soak": "k6 run k6/soak.js",
+    "k6:breakpoint": "k6 run k6/breakpoint.js",
+    "k6:pool": "k6 run k6/pool-saturation.js",
+    "k6:alert": "k6 run k6/alert-trigger.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api-logs": "^0.57.2",
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^22.10.0",
+    "@types/selenium-webdriver": "^4.1.28",
+    "selenium-webdriver": "^4.28.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

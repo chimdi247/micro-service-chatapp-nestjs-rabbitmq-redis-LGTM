@@ -1,0 +1,46 @@
+# Dependencies
+node_modules
+**/node_modules
+.pnpm-store
+
+# Build outputs
+dist
+**/dist
+*.tsbuildinfo
+
+# The React client is built separately via client/Dockerfile
+# (context: ./client), so it's never needed inside a service image.
+client
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# VCS / editor / OS
+.git
+.gitignore
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+logs
+*.log
+
+# Misc
+coverage
+.nyc_output
+.cache
+.turbo
+.eslintcache
+.prettiercache
+docker
+README.md
+request.http
+
+# Not needed in service images (keeps build context small / cache stable)
+observability
+tests

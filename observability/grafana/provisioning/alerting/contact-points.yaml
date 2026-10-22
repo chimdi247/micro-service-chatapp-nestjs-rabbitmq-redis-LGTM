@@ -1,0 +1,14 @@
+# Grafana-managed alerting: email contact point. SMTP itself is configured with
+# GF_SMTP_* environment variables on the grafana service (docker-compose.yml).
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: chatapp-email
+    receivers:
+      - uid: chatapp-email
+        type: email
+        is_default: true
+        settings:
+          addresses: ${ALERT_EMAIL_TO}
+          singleEmail: false

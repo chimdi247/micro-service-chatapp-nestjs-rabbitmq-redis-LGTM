@@ -35,7 +35,16 @@ export const validateRequest = (schemas: RequestValidationSchemas) => {
 
       if (schemas.query) {
         const parsedQuery = schemas.query.parse(req.query) as QueryRecord;
-        req.query = parsedQuery as Request["query"];
+        // Express 5: req.query is a getter on the prototype that re-parses the
+        // URL on every access, so `req.query = ...` throws and mutating the
+        // returned object is lost. Define an own property on this request that
+        // shadows the getter and holds the validated (coerced) values.
+        Object.defineProperty(req, "query", {
+          value: parsedQuery,
+          writable: true,
+          configurable: true,
+          enumerable: true,
+        });
       }
 
       next();

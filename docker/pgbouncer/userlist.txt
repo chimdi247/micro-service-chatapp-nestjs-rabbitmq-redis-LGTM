@@ -1,1 +1,1 @@
-"chatapp_user" "chatapp_user_password"
+"chatapp_user" "SCRAM-SHA-256$4096:hQcjT1Y43comZQ2nnxMOeA==$2gBAvqXIz8Y6g32vbYsyuH+PEz3GQiI6GQ/CIUZWEb4=:kaX4ghFtGUID9XtLLvpBtc7Y8ub86yC1Ymq73oMMqy8="

@@ -2,6 +2,8 @@
 # metrics_generator derives RED metrics + the service graph from spans and
 # remote-writes them to Mimir (with exemplars), powering the service map and
 # trace -> metrics links in Grafana.
+# local-blocks additionally enables TraceQL metrics queries and Grafana's
+# Traces Drilldown (Explore Traces) app.
 stream_over_http_enabled: true
 
 server:
@@ -41,6 +43,9 @@ metrics_generator:
       peer_attributes: [peer.service, db.name, db.system]
     span_metrics:
       dimensions: [http.method, http.route, http.status_code]
+    local_blocks:
+      filter_server_spans: false   # keep client/internal spans so TraceQL metrics see them
+      flush_to_storage: true       # write blocks to S3 so queries can cover older data
 
 storage:
   trace:
@@ -59,7 +64,7 @@ storage:
 overrides:
   defaults:
     metrics_generator:
-      processors: [service-graphs, span-metrics]
+      processors: [service-graphs, span-metrics, local-blocks]
 
 usage_report:
   reporting_enabled: false
